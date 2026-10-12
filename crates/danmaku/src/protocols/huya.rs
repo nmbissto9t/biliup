@@ -46,6 +46,19 @@ const HEARTBEAT: &[u8] = &[
     0x01, 0x7c, 0x82, 0x00, 0x0b, 0xb0, 0x1f, 0x9c, 0xac, 0x0b, 0x8c, 0x98, 0x0c, 0xa8, 0x0c, 0x20,
 ];
 
+/// Convert Huya's `iFontColor` into an RGB integer.
+///
+/// Huya sends `-1` (or `0`) for ordinary danmaku that has no custom color, so any
+/// non-positive value falls back to the default white. Real colors are plain
+/// 0xRRGGBB integers; the high byte is masked off to stay within 24 bits.
+fn normalize_font_color(value: i64) -> u32 {
+    if value <= 0 {
+        DEFAULT_COLOR
+    } else {
+        (value & 0x00FF_FFFF) as u32
+    }
+}
+
 /// Huya live danmaku protocol.
 pub struct Huya {
     client: reqwest::Client,
@@ -190,8 +203,12 @@ impl Huya {
             .unwrap_or_default();
         let content = ios.read_string(3).unwrap_or_default();
 
-        // Try to read color from tag 6 struct
-        let color = DEFAULT_COLOR;
+        //   tag 6: BulletFormat struct, inner tag 0 = iFontColor
+        let color = ios
+            .read_struct(6, |fmt| fmt.read_int64(0))
+            .flatten()
+            .map(normalize_font_color)
+            .unwrap_or(DEFAULT_COLOR);
 
         if content.is_empty() {
             return None;
@@ -317,6 +334,61 @@ mod tests {
             }
             other => panic!("unexpected {other:?}"),
         }
+    }
+
+    /// Same layout as the real frames: sender (0), tid (1), sid (2), content (3),
+    /// then optionally the BulletFormat struct at tag 6 with iFontColor at inner tag 0.
+    fn encode_with_font_color(content: &str, font_color: Option<i64>) -> Vec<u8> {
+        let mut oos = TarsOutputStream::new();
+        oos.write_struct_begin(0);
+        oos.write_int64(0, 42);
+        oos.write_string(2, "nick");
+        oos.write_struct_end();
+        oos.write_int64(1, 1);
+        oos.write_int64(2, 0);
+        oos.write_string(3, content);
+        // a tag-4 / tag-5 pair sits between content and the format struct in real frames
+        oos.write_int64(4, 0);
+        oos.write_struct_begin(5);
+        oos.write_int64(0, 8150354);
+        oos.write_int64(3, 16731238);
+        oos.write_struct_end();
+        if let Some(color) = font_color {
+            oos.write_struct_begin(6);
+            oos.write_int64(0, color);
+            oos.write_int64(1, 4);
+            oos.write_struct_end();
+        }
+        oos.get_buffer().to_vec()
+    }
+
+    fn chat_color(data: &[u8]) -> u32 {
+        match Huya::parse_danmaku(data).expect("danmaku") {
+            DanmakuEvent::Chat(chat) => chat.color,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_danmaku_reads_font_color() {
+        // values taken from real Huya frames
+        assert_eq!(chat_color(&encode_with_font_color("a", Some(1751616))), 1751616);
+        assert_eq!(chat_color(&encode_with_font_color("a", Some(16763904))), 16763904);
+        assert_eq!(chat_color(&encode_with_font_color("a", Some(15673460))), 15673460);
+    }
+
+    #[test]
+    fn parse_danmaku_defaults_to_white_without_font_color() {
+        // -1 / 0 mean "no custom color"; a missing struct must not break parsing either
+        assert_eq!(chat_color(&encode_with_font_color("a", Some(-1))), DEFAULT_COLOR);
+        assert_eq!(chat_color(&encode_with_font_color("a", Some(0))), DEFAULT_COLOR);
+        assert_eq!(chat_color(&encode_with_font_color("a", None)), DEFAULT_COLOR);
+    }
+
+    #[test]
+    fn normalize_font_color_masks_to_rgb() {
+        assert_eq!(normalize_font_color(0x01FF_CC00), 0x00FF_CC00);
+        assert_eq!(normalize_font_color(-5), DEFAULT_COLOR);
     }
 
     #[test]

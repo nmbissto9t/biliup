@@ -552,7 +552,7 @@ impl<'a> HuyaLive<'a> {
             url: self.url.clone(),
             room_id: None,
             cookie: None,
-            raw: false,
+            raw: true,
             detail: true,
             extra: HashMap::new(),
             movie_id: None,

@@ -14,7 +14,7 @@ use tracing::debug;
 
 use crate::codec::tars::{TarsInputStream, TarsOutputStream};
 use crate::error::{DanmakuError, Result};
-use crate::message::{ChatMessage, DEFAULT_COLOR, DanmakuEvent, GiftMessage};
+use crate::message::{ChatMessage, DEFAULT_COLOR, DanmakuEvent};
 use crate::protocols::{
     ConnectionInfo, DecodeResult, HeartbeatConfig, Platform, PlatformContext, RegistrationData,
 };
@@ -88,16 +88,15 @@ impl Huya {
             .map(|m| m.as_str().to_string())
     }
 
-    /// Get UID and channel ids (tid / sid) from the room page.
-    ///
-    /// The uid is required. The channel ids are best-effort:礼物、进场等房间级的推送
-    /// 看起来要带上频道号注册才会收到，拿不到就退回 0（和以前的行为一致）。
-    async fn get_room_info(&self, room_id: &str) -> Result<(u64, i64, i64)> {
+    /// Get UID from room page.
+    async fn get_room_uid(&self, room_id: &str) -> Result<u64> {
         let url = format!("https://www.huya.com/{}", room_id);
+        let headers = Self::default_headers();
+
         let resp = self
             .client
             .get(&url)
-            .headers(Self::default_headers())
+            .headers(headers)
             .timeout(Duration::from_secs(10))
             .send()
             .await?
@@ -107,62 +106,15 @@ impl Huya {
         // Extract UID from page: "uid":"123456" or "uid":123456
         let re = Regex::new(r#"uid['"]*:\s*['"]*(\d+)['"]*"#)
             .map_err(|e| DanmakuError::Decode(e.to_string()))?;
-        let uid = re
-            .captures(&resp)
+
+        re.captures(&resp)
             .and_then(|c| c.get(1))
             .and_then(|m| m.as_str().parse::<u64>().ok())
-            .ok_or_else(|| DanmakuError::Decode("Failed to extract UID from Huya page".to_string()))?;
-
-        let (mut tid, mut sid) = Self::extract_channel_ids(&resp);
-        if tid == 0 && sid == 0 {
-            // 桌面页里没有的话，再试手机页（其他虎牙弹幕项目用的就是这个页面）
-            if let Ok(mobile) = self.fetch_mobile_page(room_id).await {
-                (tid, sid) = Self::extract_channel_ids(&mobile);
-            }
-        }
-        debug!("Huya channel ids: tid={tid} sid={sid}");
-        Ok((uid, tid, sid))
-    }
-
-    async fn fetch_mobile_page(&self, room_id: &str) -> Result<String> {
-        let mut headers = HeaderMap::new();
-        headers.insert(
-            USER_AGENT,
-            HeaderValue::from_static(
-                "Mozilla/5.0 (Linux; Android 6.0; Nexus 5 Build/MRA58N) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.88 Mobile Safari/537.36",
-            ),
-        );
-        Ok(self
-            .client
-            .get(format!("https://m.huya.com/{room_id}"))
-            .headers(headers)
-            .timeout(Duration::from_secs(10))
-            .send()
-            .await?
-            .text()
-            .await?)
-    }
-
-    /// Pull lChannelId / lSubChannelId out of a room page; 0 when absent.
-    fn extract_channel_ids(page: &str) -> (i64, i64) {
-        let find = |key: &str| -> i64 {
-            Regex::new(&format!(r#"{key}['"]?\s*[:=]\s*['"]?(\d+)"#))
-                .ok()
-                .and_then(|re| re.captures(page).and_then(|c| c.get(1)).map(|m| m.as_str().to_string()))
-                .and_then(|v| v.parse::<i64>().ok())
-                .unwrap_or(0)
-        };
-        (find("lChannelId"), find("lSubChannelId"))
+            .ok_or_else(|| DanmakuError::Decode("Failed to extract UID from Huya page".to_string()))
     }
 
     /// Build WSUserInfo TARS structure.
-    #[cfg(test)]
     fn build_ws_user_info(uid: u64) -> Vec<u8> {
-        Self::build_ws_user_info_with(uid, 0, 0)
-    }
-
-    /// Same, with the room's channel ids (lTid / lSid).
-    fn build_ws_user_info_with(uid: u64, tid: i64, sid: i64) -> Vec<u8> {
         let mut oos = TarsOutputStream::new();
 
         // WSUserInfo fields:
@@ -179,8 +131,8 @@ impl Huya {
         oos.write_bool(1, false); // Not anonymous
         oos.write_string(2, ""); // sGuid
         oos.write_string(3, ""); // sToken
-        oos.write_int64(4, tid); // lTid
-        oos.write_int64(5, sid); // lSid
+        oos.write_int64(4, 0); // lTid
+        oos.write_int64(5, 0); // lSid
         oos.write_int64(6, uid as i64); // lGroupId = uid
         oos.write_int64(7, 3); // lGroupType = 3
 
@@ -219,30 +171,13 @@ impl Huya {
                 // Check message type at tag 1
                 let msg_type = inner_ios.read_int64(1).unwrap_or(0);
 
-                if msg_type == 6501 {
-                    // 礼物：SendItemSubBroadcastPacket
-                    let body = inner_ios.read_bytes(2).unwrap_or_default();
-                    if let Some(event) = Self::parse_gift(&body) {
-                        events.push(event);
-                    } else {
-                        events.push(DanmakuEvent::Other {
-                            raw_data: format_raw_frame(msg_type, &body),
-                        });
-                    }
-                } else if msg_type == 1400 {
+                if msg_type == 1400 {
                     // Danmaku message - read message body at tag 2
                     if let Some(msg_data) = inner_ios.read_bytes(2) {
                         if let Some(event) = Self::parse_danmaku(&msg_data) {
                             events.push(event);
                         }
                     }
-                } else {
-                    // 临时抓包：除弹幕外的消息（礼物、进场等）还没有解析，原样记下来。
-                    // 只有打开 raw 时才会写进 XML 的 <o> 里；用来摸清礼物包的格式。
-                    let body = inner_ios.read_bytes(2).unwrap_or_default();
-                    events.push(DanmakuEvent::Other {
-                        raw_data: format_raw_frame(msg_type, &body),
-                    });
                 }
             }
         } else if cmd_type == cmd_type::REGISTER_RSP {
@@ -254,36 +189,6 @@ impl Huya {
         events
     }
 
-    /// Parse a gift broadcast (message type 6501, SendItemSubBroadcastPacket):
-    ///   tag 0 iItemType（礼物编号）, tag 2 iItemCount, tag 3 lPresenterUid, tag 4 lSenderUid,
-    ///   tag 5 sPresenterNick, tag 6 sSenderNick, tag 7 sSendContent
-    /// 礼物名和价格不在这个包里（要另外查礼物表），这里先记下礼物编号。
-    fn parse_gift(data: &[u8]) -> Option<DanmakuEvent> {
-        let mut ios = TarsInputStream::new(data);
-        let item_type = ios.read_int64(0)?;
-        let count = ios.read_int64(2).unwrap_or(1).max(1);
-        let presenter_uid = ios.read_int64(3).unwrap_or(0);
-        let sender_uid = ios.read_int64(4).unwrap_or(0);
-        let presenter_nick = ios.read_string(5).unwrap_or_default();
-        let sender_nick = ios.read_string(6).unwrap_or_default();
-        let send_content = ios.read_string(7).unwrap_or_default();
-
-        let content = format!(
-            "主播={presenter_nick}({presenter_uid}) {send_content}"
-        )
-        .trim()
-        .to_string();
-        Some(DanmakuEvent::Gift(GiftMessage {
-            name: sender_nick,
-            uid: sender_uid.max(0) as u64,
-            gift_name: format!("礼物#{item_type}"),
-            price: 0,
-            num: count.min(u32::MAX as i64) as u32,
-            content,
-            timestamp: chrono::Utc::now(),
-        }))
-    }
-
     /// Parse a danmaku message.
     fn parse_danmaku(data: &[u8]) -> Option<DanmakuEvent> {
         let mut ios = TarsInputStream::new(data);
@@ -293,7 +198,7 @@ impl Huya {
         //   tag 1: lTid (int64)
         //   tag 2: lSid (int64)  —— 旧实现把这个当成用户名来读
         //   tag 3: sContent
-        //     inner tag 0 = lUid, inner tag 2 = nickname
+        //     inner tag 0 = lUid（发送者 uid）, inner tag 2 = nickname
         let (uid, name) = ios
             .read_struct(0, |user| {
                 (
@@ -327,31 +232,6 @@ impl Huya {
     }
 }
 
-/// 临时抓包用：把一条还没解析的消息记成一行文本
-/// `huya type=<消息类型> len=<字节数> strings=<能读出的文字> hex=<十六进制>`。
-fn format_raw_frame(msg_type: i64, body: &[u8]) -> String {
-    const MAX_BYTES: usize = 2048;
-    let shown = &body[..body.len().min(MAX_BYTES)];
-    let hex: String = shown.iter().map(|b| format!("{b:02x}")).collect();
-    let more = if body.len() > MAX_BYTES { "..." } else { "" };
-
-    // 顺便把里面能读出来的文字（昵称、礼物名等）抽出来，方便一眼看出是什么消息
-    let text: String = String::from_utf8_lossy(shown)
-        .chars()
-        .map(|c| if c.is_control() || c == '\u{FFFD}' { '\u{1}' } else { c })
-        .collect();
-    let strings: Vec<&str> = text
-        .split('\u{1}')
-        .filter(|t| t.chars().count() >= 2)
-        .collect();
-
-    format!(
-        "huya type={msg_type} len={} strings=[{}] hex={hex}{more}",
-        body.len(),
-        strings.join(" | ")
-    )
-}
-
 impl Default for Huya {
     fn default() -> Self {
         Self::new()
@@ -378,11 +258,11 @@ impl Platform for Huya {
         };
 
         // Get UID from room page
-        let (uid, tid, sid) = self.get_room_info(&room_id).await?;
+        let uid = self.get_room_uid(&room_id).await?;
         debug!("Huya room UID: {}", uid);
 
         // Build registration packet
-        let user_info = Self::build_ws_user_info_with(uid, tid, sid);
+        let user_info = Self::build_ws_user_info(uid);
         let reg_packet = Self::build_ws_command(cmd_type::REGISTER_REQ, &user_info);
 
         Ok(ConnectionInfo::new(WSS_URL)
@@ -533,46 +413,6 @@ mod tests {
         }
     }
 
-    fn encode_push(msg_type: i64, body: &[u8]) -> Vec<u8> {
-        let mut inner = TarsOutputStream::new();
-        inner.write_int64(1, msg_type);
-        inner.write_bytes(2, body);
-        let mut outer = TarsOutputStream::new();
-        outer.write_int32(0, cmd_type::MSG_PUSH_REQ);
-        outer.write_bytes(1, inner.get_buffer());
-        outer.get_buffer().to_vec()
-    }
-
-    #[test]
-    fn non_danmaku_messages_are_kept_as_raw_frames() {
-        let events = Huya::parse_message(&encode_push(6501, "送礼人Bob\u{1}小礼物".as_bytes()));
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            DanmakuEvent::Other { raw_data } => {
-                assert!(raw_data.starts_with("huya type=6501 len="), "{raw_data}");
-                assert!(raw_data.contains("送礼人Bob"), "{raw_data}");
-                assert!(raw_data.contains("hex=e980"), "{raw_data}");
-            }
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    #[test]
-    fn danmaku_messages_are_not_duplicated_as_raw_frames() {
-        let body = encode_message_notice("alice", 0, "hi");
-        let events = Huya::parse_message(&encode_push(1400, &body));
-        assert_eq!(events.len(), 1);
-        assert!(matches!(events[0], DanmakuEvent::Chat(_)));
-    }
-
-    #[test]
-    fn raw_frame_truncates_long_bodies() {
-        let body = vec![0xAB; 5000];
-        let line = format_raw_frame(1, &body);
-        assert!(line.contains("len=5000"));
-        assert!(line.ends_with("..."));
-    }
-
     #[test]
     fn parse_danmaku_reads_sender_uid() {
         let mut oos = TarsOutputStream::new();
@@ -582,63 +422,24 @@ mod tests {
         oos.write_struct_end();
         oos.write_string(3, "hi");
         match Huya::parse_danmaku(oos.get_buffer()).expect("danmaku") {
-            DanmakuEvent::Chat(chat) => assert_eq!(chat.uid, Some(1201380667217)),
-            other => panic!("unexpected {other:?}"),
-        }
-    }
-
-    fn encode_gift() -> Vec<u8> {
-        let mut oos = TarsOutputStream::new();
-        oos.write_int32(0, 4);
-        oos.write_string(1, "pay");
-        oos.write_int32(2, 3);
-        oos.write_int64(3, 555);
-        oos.write_int64(4, 777);
-        oos.write_string(5, "主播A");
-        oos.write_string(6, "送礼人B");
-        oos.write_string(7, "送出");
-        oos.get_buffer().to_vec()
-    }
-
-    #[test]
-    fn gift_packets_become_gift_events() {
-        let events = Huya::parse_message(&encode_push(6501, &encode_gift()));
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            DanmakuEvent::Gift(g) => {
-                assert_eq!(g.name, "送礼人B");
-                assert_eq!(g.uid, 777);
-                assert_eq!(g.num, 3);
-                assert_eq!(g.gift_name, "礼物#4");
-                assert!(g.content.contains("主播A(555)"), "{}", g.content);
+            DanmakuEvent::Chat(chat) => {
+                assert_eq!(chat.uid, Some(1201380667217));
+                assert_eq!(chat.name.as_deref(), Some("nick"));
             }
             other => panic!("unexpected {other:?}"),
         }
     }
 
     #[test]
-    fn broken_gift_packet_falls_back_to_raw_frame() {
-        let events = Huya::parse_message(&encode_push(6501, &[0x01, 0x02]));
-        assert!(matches!(events[0], DanmakuEvent::Other { .. }));
-    }
-
-    #[test]
-    fn channel_ids_are_read_from_page_text() {
-        let page = r#"var x = {"lChannelId":1199666880047,"lSubChannelId":1199666880047,"lYyid":1}"#;
-        assert_eq!(Huya::extract_channel_ids(page), (1199666880047, 1199666880047));
-        assert_eq!(Huya::extract_channel_ids("nothing here"), (0, 0));
-    }
-
-    #[test]
-    fn registration_carries_channel_ids() {
-        let data = Huya::build_ws_user_info_with(12345, 111, 222);
-        let mut ios = TarsInputStream::new(&data);
-        assert_eq!(ios.read_int64(0), Some(12345));
-        assert_eq!(ios.read_int64(4), Some(111));
-        assert_eq!(ios.read_int64(5), Some(222));
-        // old entry point keeps the previous behavior
-        let old = Huya::build_ws_user_info(12345);
-        let mut ios = TarsInputStream::new(&old);
-        assert_eq!(ios.read_int64(4), Some(0));
+    fn parse_danmaku_without_uid_keeps_uid_empty() {
+        let mut oos = TarsOutputStream::new();
+        oos.write_struct_begin(0);
+        oos.write_string(2, "nick");
+        oos.write_struct_end();
+        oos.write_string(3, "hi");
+        match Huya::parse_danmaku(oos.get_buffer()).expect("danmaku") {
+            DanmakuEvent::Chat(chat) => assert_eq!(chat.uid, None),
+            other => panic!("unexpected {other:?}"),
+        }
     }
 }

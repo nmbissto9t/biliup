@@ -553,7 +553,7 @@ impl<'a> HuyaLive<'a> {
             room_id: None,
             cookie: None,
             raw: false,
-            detail: false,
+            detail: true,
             extra: HashMap::new(),
             movie_id: None,
             password: None,
